@@ -1,0 +1,23 @@
+[project]
+name = "ecommerce-analytics-hub"
+version = "0.1.0"
+description = "Monorepo Root"
+requires-python = ">=3.12"
+dependencies = [
+    "backend",
+    "mock-generator",
+    "spark-jobs",
+]
+
+[tool.uv]
+package = false
+workspace.members = ["backend", "mock-generator", "spark-jobs"]
+
+[tool.uv.sources]
+backend = { workspace = true }
+mock-generator = { workspace = true }
+spark-jobs = { workspace = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
