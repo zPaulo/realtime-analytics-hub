@@ -1,0 +1,23 @@
+[project]
+name = "backend"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3>=1.42.43",
+    "channels>=4.3.2",
+    "channels-redis>=4.3.0",
+    "daphne>=4.2.1",
+    "delta-spark>=4.0.1",
+    "deltalake>=1.4.1",
+    "django>=6.0.2",
+    "django-cors-headers>=4.9.0",
+    "djangorestframework>=3.16.1",
+    "pandas>=3.0.0",
+    "psycopg2-binary>=2.9.11",
+    "pyarrow>=23.0.0",
+    "pyspark>=4.1.1",
+    "python-decouple>=3.8",
+    "redis>=7.1.0",
+]
