@@ -1,0 +1,353 @@
+services:  
+  postgres:
+    image: postgres:${POSTGRES_VERSION:-16}
+    container_name: ${POSTGRES_CONTAINER_NAME:-ecommerce_postgres}
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Redis Cache
+  redis:
+    image: redis:${REDIS_VERSION:-7-alpine}
+    container_name: ${REDIS_CONTAINER_NAME:-ecommerce_redis}
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # MinIO (S3-compatible storage)
+  minio:
+    image: minio/minio:${MINIO_VERSION:-latest}
+    container_name: ${MINIO_CONTAINER_NAME:-ecommerce_minio}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Cria o bucket delta-lake no MinIO (uma vez ao subir o stack)
+  minio-init:
+    image: minio/mc:latest
+    container_name: ${MINIO_INIT_CONTAINER_NAME:-ecommerce_minio_init}
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 $${MINIO_ROOT_USER} $${MINIO_ROOT_PASSWORD};
+      mc mb myminio/${DELTA_LAKE_BUCKET:-delta-lake} --ignore-existing;
+      echo 'Bucket ${DELTA_LAKE_BUCKET:-delta-lake} pronto.';
+      exit 0;
+      "
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - DELTA_LAKE_BUCKET=${DELTA_LAKE_BUCKET:-delta-lake}
+    networks:
+      - ecommerce_network
+    restart: "no"
+
+  # Zookeeper (required for Kafka)
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: ${ZOOKEEPER_CONTAINER_NAME:-ecommerce_zookeeper}
+    environment:
+      ZOOKEEPER_CLIENT_PORT: ${ZOOKEEPER_CLIENT_PORT:-2181}
+      ZOOKEEPER_TICK_TIME: ${ZOOKEEPER_TICK_TIME:-2000}
+    ports:
+      - "${ZOOKEEPER_PORT:-2181}:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Kafka (Mude a imagem e garanta as variáveis Confluent)
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: ${KAFKA_CONTAINER_NAME:-ecommerce_kafka}
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "${KAFKA_PORT:-9092}:9092"
+    environment:
+      KAFKA_BROKER_ID: ${KAFKA_BROKER_ID:-1}
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Spark Master
+  spark-master:
+    image: apache/spark:${SPARK_VERSION:-3.5.0}
+    container_name: ${SPARK_MASTER_CONTAINER_NAME:-ecommerce_spark_master}
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+    ports:
+      - "${SPARK_MASTER_WEBUI_PORT:-8080}:8080"
+      - "${SPARK_MASTER_PORT:-7077}:7077"
+    volumes:
+      - spark_master_data:/opt/spark/data
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Spark Worker
+  spark-worker:
+    image: apache/spark:${SPARK_VERSION:-3.5.0}
+    container_name: ${SPARK_WORKER_CONTAINER_NAME:-ecommerce_spark_worker}
+    depends_on:
+      - spark-master
+      - kafka
+      - minio
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_CORES=${SPARK_WORKER_CORES:-2}
+      - SPARK_WORKER_MEMORY=${SPARK_WORKER_MEMORY:-2g}
+      - SPARK_WORKER_PORT=8881
+      - SPARK_WORKER_WEBUI_PORT=8081
+    ports:
+      - "${SPARK_WORKER_WEBUI_PORT:-8081}:8081"
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+      - spark_worker_data:/opt/spark/data
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Django Backend
+  django:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      args:
+        - PYTHON_VERSION=${PYTHON_VERSION:-3.11}
+    container_name: ${DJANGO_CONTAINER_NAME:-ecommerce_django}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "${DJANGO_PORT:-8000}:8000"
+    environment:
+      # Django Core
+      - DEBUG=${DEBUG}
+      - SECRET_KEY=${SECRET_KEY}
+      - ALLOWED_HOSTS=${ALLOWED_HOSTS}
+      - DJANGO_SETTINGS_MODULE=${DJANGO_SETTINGS_MODULE:-config.settings}
+      
+      # Database
+      - DB_ENGINE=${DB_ENGINE:-django.db.backends.postgresql}
+      - DB_NAME=${POSTGRES_DB}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_HOST=${DB_HOST:-postgres}
+      - DB_PORT=${DB_PORT:-5432}
+      
+      # Redis
+      - REDIS_HOST=${REDIS_HOST:-redis}
+      - REDIS_PORT=${REDIS_PORT:-6379}
+      - REDIS_DB=${REDIS_DB:-0}
+      
+      # MinIO/S3
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-minio:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - MINIO_SECURE=${MINIO_SECURE:-False}
+      
+      # Delta Lake
+      - DELTA_LAKE_BUCKET=${DELTA_LAKE_BUCKET:-delta-lake}
+      
+      # CORS
+      - CORS_ALLOWED_ORIGINS=${CORS_ALLOWED_ORIGINS}
+    volumes:
+      - ./backend:/app/backend
+      - django_static:/app/staticfiles
+      - django_media:/app/media
+    command: >
+      sh -c "
+        echo '📦 Rodando migrations...' &&
+        python manage.py migrate --noinput &&
+        echo '📊 Coletando arquivos estáticos...' &&
+        python manage.py collectstatic --noinput &&
+        echo '🚀 Iniciando servidor...' &&
+        daphne -b 0.0.0.0 -p 8000 config.asgi:application
+      "
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Mock Data Generator (envia eventos para o Kafka; inicia automaticamente ao subir)
+  mock-generator:
+    build:
+      context: .
+      dockerfile: mock-generator/Dockerfile
+    container_name: ${MOCK_CONTAINER_NAME:-ecommerce_mocks}
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      - MOCK_AUTO_START=${MOCK_AUTO_START:-true}
+      - MOCK_INTERVAL_MIN=${MOCK_INTERVAL_MIN:-1}
+      - MOCK_INTERVAL_MAX=${MOCK_INTERVAL_MAX:-5}
+    volumes:
+      - ./mock-generator:/app/mock-generator
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Spark Streaming: consome Kafka e grava agregações no MinIO (Delta Lake)
+  spark-streaming:
+    build:
+      context: .
+      dockerfile: spark-jobs/Dockerfile
+    container_name: ${SPARK_STREAMING_CONTAINER_NAME:-ecommerce_spark_streaming}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT:-http://minio:9000}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - DELTA_LAKE_BUCKET=${DELTA_LAKE_BUCKET:-delta-lake}
+    volumes:
+      - ./spark-jobs:/opt/spark-jobs
+    command: >
+      /opt/spark/bin/spark-submit
+      --master local[*]
+      --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,io.delta:delta-spark_2.12:3.0.0,org.apache.hadoop:hadoop-aws:3.3.4
+      --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension
+      --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog
+      --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
+      --conf spark.hadoop.fs.s3a.access.key=${MINIO_ROOT_USER}
+      --conf spark.hadoop.fs.s3a.secret.key=${MINIO_ROOT_PASSWORD}
+      --conf spark.hadoop.fs.s3a.path.style.access=true
+      --conf spark.hadoop.fs.s3a.connection.ssl.enabled=false
+      --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+      --conf spark.sql.shuffle.partitions=4
+      /opt/spark-jobs/streaming_sales_agg.py
+    networks:
+      - ecommerce_network
+    restart: unless-stopped
+
+  # Frontend React (opcional - adicione quando criar)
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: ${FRONTEND_CONTAINER_NAME:-ecommerce_frontend}
+  #   depends_on:
+  #     - django
+  #   ports:
+  #     - "${FRONTEND_PORT:-3000}:3000"
+  #   environment:
+  #     - REACT_APP_API_URL=${REACT_APP_API_URL}
+  #     - REACT_APP_WS_URL=${REACT_APP_WS_URL}
+  #   volumes:
+  #     - ./frontend:/app
+  #     - /app/node_modules
+  #   networks:
+  #     - ecommerce_network
+  #   restart: unless-stopped
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  minio_data:
+    driver: local
+  zookeeper_data:
+    driver: local
+  zookeeper_logs:
+    driver: local
+  kafka_data:
+    driver: local
+  spark_master_data:
+    driver: local
+  spark_worker_data:
+    driver: local
+  django_static:
+    driver: local
+  django_media:
+    driver: local
+
+networks:
+  ecommerce_network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${NETWORK_SUBNET:-172.20.0.0/16}
